@@ -20,6 +20,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection.Metadata;
@@ -151,8 +152,13 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			}
 			TargetDirectory = targetDirectory;
 			directories.Clear();
+
+			var metadata = file.Metadata;
+			var fs = file.Metadata.GetTopLevelTypeDefinitions().Where(td => IncludeTypeWhenDecompilingProject(file, td))
+				.GroupBy(td => GetFileFileNameForHandle(metadata, td), StringComparer.OrdinalIgnoreCase).ToList();
+
 			var resources = WriteResourceFilesInProject(file).ToList();
-			var files = WriteCodeFilesInProject(file, resources.SelectMany(r => r.PartialTypes ?? Enumerable.Empty<PartialTypeInfo>()).ToList(), cancellationToken).ToList();
+			var files = WriteCodeFilesInProject(file, fs, resources.SelectMany(r => r.PartialTypes ?? Enumerable.Empty<PartialTypeInfo>()).ToList(), cancellationToken).ToList();
 			files.AddRange(resources);
 			var module = file as PEFile;
 			if (module != null)
@@ -168,6 +174,50 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 
 			string platformName = module != null ? TargetServices.GetPlatformName(module) : "AnyCPU";
 			return new ProjectId(platformName, ProjectGuid, ProjectTypeGuids.CSharpWindows);
+		}
+
+		string GetFileFileNameForHandle(MetadataReader metadata, TypeDefinitionHandle h)
+		{
+			var type = metadata.GetTypeDefinition(h);
+			string file = SanitizeFileName(metadata.GetString(type.Name) + ".cs");
+			string ns = metadata.GetString(type.Namespace);
+			if (string.IsNullOrEmpty(ns))
+			{
+				return file;
+			}
+			else
+			{
+				string dir = Settings.UseNestedDirectoriesForNamespaces ? CleanUpPath(ns) : CleanUpDirectoryName(ns);
+
+				if (Settings.UseNestedDirectoriesForNamespaces)
+				{
+					var sp = dir.Split('.');
+					for (int i = sp.Length; i > 0; i--)
+					{
+						var dir2 = string.Join(Path.DirectorySeparatorChar.ToString(), sp, 0, i);
+						if (directories.Contains(dir2))
+						{
+							dir = Path.Combine(dir2, string.Join(".", sp, i, sp.Length - i));
+							break;
+						}
+					}
+				}
+
+				if (directories.Add(dir))
+				{
+					var path = Path.Combine(TargetDirectory, dir);
+					try
+					{
+						Directory.CreateDirectory(path);
+					}
+					catch (IOException)
+					{
+						File.Delete(path);
+						Directory.CreateDirectory(path);
+					}
+				}
+				return Path.Combine(dir, file);
+			}
 		}
 
 		#region WriteCodeFilesInProject
@@ -213,11 +263,11 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			return new[] { new ProjectItemInfo("Compile", assemblyInfo) };
 		}
 
-		IEnumerable<ProjectItemInfo> WriteCodeFilesInProject(MetadataFile module, IList<PartialTypeInfo> partialTypes, CancellationToken cancellationToken)
+		IEnumerable<ProjectItemInfo> WriteCodeFilesInProject(MetadataFile module,
+			List<IGrouping<string, TypeDefinitionHandle>> files, IList<PartialTypeInfo> partialTypes,
+			CancellationToken cancellationToken)
 		{
 			var metadata = module.Metadata;
-			var files = module.Metadata.GetTopLevelTypeDefinitions().Where(td => IncludeTypeWhenDecompilingProject(module, td))
-				.GroupBy(GetFileFileNameForHandle, StringComparer.OrdinalIgnoreCase).ToList();
 			var progressReporter = ProgressIndicator;
 			var progress = new DecompilationProgress { TotalUnits = files.Count, Title = "Exporting project..." };
 			DecompilerTypeSystem ts = new DecompilerTypeSystem(module, AssemblyResolver, Settings);
@@ -227,7 +277,7 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			while (workList.Count > 0)
 			{
 				var additionalFiles = workList
-					.GroupBy(GetFileFileNameForHandle, StringComparer.OrdinalIgnoreCase).ToList();
+					.GroupBy(td => GetFileFileNameForHandle(metadata, td), StringComparer.OrdinalIgnoreCase).ToList();
 				workList.Clear();
 				ProcessFiles(additionalFiles);
 				files.AddRange(additionalFiles);
@@ -235,35 +285,6 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			}
 
 			return files.Select(f => new ProjectItemInfo("Compile", f.Key)).Concat(WriteAssemblyInfo(ts, cancellationToken));
-
-			string GetFileFileNameForHandle(TypeDefinitionHandle h)
-			{
-				var type = metadata.GetTypeDefinition(h);
-				string file = CleanUpFileName(metadata.GetString(type.Name), ".cs");
-				string ns = metadata.GetString(type.Namespace);
-				if (string.IsNullOrEmpty(ns))
-				{
-					return file;
-				}
-				else
-				{
-					string dir = Settings.UseNestedDirectoriesForNamespaces ? CleanUpPath(ns) : CleanUpDirectoryName(ns);
-					if (directories.Add(dir))
-					{
-						var path = Path.Combine(TargetDirectory, dir);
-						try
-						{
-							Directory.CreateDirectory(path);
-						}
-						catch (IOException)
-						{
-							File.Delete(path);
-							Directory.CreateDirectory(path);
-						}
-					}
-					return Path.Combine(dir, file);
-				}
-			}
 
 			void ProcessFiles(List<IGrouping<string, TypeDefinitionHandle>> files)
 			{
@@ -341,6 +362,8 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 							foreach (var (name, value) in resourcesFile)
 							{
 								string fileName = SanitizeFileName(name);
+								TextInfo textInfo = CultureInfo.CurrentCulture.TextInfo;
+								fileName = textInfo.ToTitleCase(fileName);
 								string dirName = Path.GetDirectoryName(fileName);
 								if (!string.IsNullOrEmpty(dirName) && directories.Add(dirName))
 								{
@@ -439,7 +462,7 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 			// the directory part Namespace1\Namespace2\... reuses as many existing directories as
 			// possible, and only the remaining name parts are used as prefix for the filename.
 			// This is not affected by the UseNestedDirectoriesForNamespaces setting.
-			string[] splitName = fullName.Split('\\', '/');
+			string[] splitName = fullName.Split('\\', '/', '.');
 			string fileName = string.Join(".", splitName);
 			string separator = Path.DirectorySeparatorChar.ToString();
 			for (int i = splitName.Length - 1; i > 0; i--)
@@ -451,6 +474,23 @@ namespace ICSharpCode.Decompiler.CSharp.ProjectDecompiler
 					fileName = Path.Combine(ns, name);
 					break;
 				}
+
+				var findPath = false;
+				for (int j = 2; j <= i; j++)
+				{
+					ns = string.Join(separator, splitName, 0, i - j);
+					string ns2 = Path.Combine(ns, string.Join(".", splitName, i - j, j));
+					if (directories.Contains(ns2))
+					{
+						string name = string.Join(".", splitName, i, splitName.Length - i);
+						fileName = Path.Combine(ns2, name);
+						findPath = true;
+						break;
+					}
+				}
+
+				if (findPath)
+					break;
 			}
 			return fileName;
 		}
